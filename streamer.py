@@ -2,6 +2,7 @@
 from lossy_socket import LossyUDP
 # do not import anything else from socket except INADDR_ANY
 from socket import INADDR_ANY
+import struct
 
 
 class Streamer:
@@ -14,21 +15,40 @@ class Streamer:
         self.dst_ip = dst_ip
         self.dst_port = dst_port
 
+        self.next_send_seq = 0
+        self.expected_recv_seq = 0  
+        self.receive_buffer = {}
+
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
-        # Your code goes here!  The code below should be changed!
-
-        # for now I'm just sending the raw application-level data in one UDP payload
-        self.socket.sendto(data_bytes, (self.dst_ip, self.dst_port))
+        MAX_PAYLOAD = 1468
+    # 2. Loop through the data_bytes using slicing
+        for i in range(0, len(data_bytes), MAX_PAYLOAD):
+            datachunk = data_bytes[i : i + MAX_PAYLOAD]
+            header = struct.pack('!I', self.next_send_seq)
+            packet = header + datachunk
+            self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+            self.next_send_seq += 1
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
-        # your code goes here!  The code below should be changed!
         
-        # this sample code just calls the recvfrom method on the LossySocket
-        data, addr = self.socket.recvfrom()
-        # For now, I'll just pass the full UDP payload to the app
-        return data
+        while self.expected_recv_seq not in self.receive_buffer:
+            # Waiting for packet to arrive
+            data, addr = self.socket.recvfrom()
+            
+            # Unpack  first 4 bytes to get seqeunce number
+            header = data[:4]
+            seq_num = struct.unpack('!I', header)[0]
+            payload = data[4:]
+            
+            # Store it in waiting area
+            self.receive_buffer[seq_num] = payload
+
+        # Once this line is reached, packet is in buffer
+        message = self.receive_buffer.pop(self.expected_recv_seq)
+        self.expected_recv_seq += 1
+        return message
 
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
