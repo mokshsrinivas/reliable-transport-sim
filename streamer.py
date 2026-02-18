@@ -21,14 +21,26 @@ class Streamer:
         self.dst_port = dst_port
 
         self.next_send_seq = 0
-        self.expected_recv_seq = 0  
+        self.expected_recv_seq = 0
         self.receive_buffer = {}
+
+        # Part 5: track individual unacked packets for pipelining
+        self.unacked_packets = {}  # seq -> (packet_bytes, send_time)
+        self.acked = set()
+        self.fin_received = False
 
         self.lock = threading.Lock()
         self.closed = False
-        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.executor = ThreadPoolExecutor(max_workers=2)
         self.executor.submit(self.listener)
-        self.acked_seq = -1
+        self.executor.submit(self._retransmit_loop)
+
+    def _compute_hash(self, seq_num, p_type, payload=b''):
+        """Compute MD5 hash over header fields + payload (not the hash field itself)."""
+        h = hashlib.md5()
+        h.update(struct.pack('!IB', seq_num, p_type))
+        h.update(payload)
+        return h.digest()
 
     def listener(self):
         while not self.closed:
@@ -36,30 +48,34 @@ class Streamer:
                 data, addr = self.socket.recvfrom()
                 if not data or len(data) < 21:
                     continue
-                header = struct.unpack('!IB16s', data[:21])
-                seq_num = header[0]
-                p_type = header[1]
-                received_hash = header[2]
+
+                seq_num, p_type, received_hash = struct.unpack('!IB16s', data[:21])
                 payload = data[21:]
 
-                if p_type == 0:
-                    h = hashlib.md5()
-                    h.update(payload)
-                    if h.digest() != received_hash:
-                        print("Corrupted!")
-                        continue 
+                # Verify hash for ALL packet types
+                expected_hash = self._compute_hash(seq_num, p_type, payload)
+                if received_hash != expected_hash:
+                    continue
 
+                if p_type == 0:  # DATA
                     with self.lock:
                         self.receive_buffer[seq_num] = payload
-                        ack_packet = struct.pack('!IB16s', seq_num, 1, b'\x00'*16)
-                        self.socket.sendto(ack_packet, (self.dst_ip, self.dst_port))
-                
-                elif p_type == 1: 
-                    with self.lock:
-                        self.acked_seq = max(self.acked_seq, seq_num)
+                    # Send ACK (with proper hash)
+                    ack_hash = self._compute_hash(seq_num, 1)
+                    ack_packet = struct.pack('!IB16s', seq_num, 1, ack_hash)
+                    self.socket.sendto(ack_packet, (self.dst_ip, self.dst_port))
 
-                elif p_type == 2: 
-                    ack_packet = struct.pack('!IB16s', seq_num, 1, b'\x00'*16)
+                elif p_type == 1:  # ACK
+                    with self.lock:
+                        self.acked.add(seq_num)
+                        self.unacked_packets.pop(seq_num, None)
+
+                elif p_type == 2:  # FIN
+                    with self.lock:
+                        self.fin_received = True
+                    # ACK the FIN (with proper hash)
+                    ack_hash = self._compute_hash(seq_num, 1)
+                    ack_packet = struct.pack('!IB16s', seq_num, 1, ack_hash)
                     self.socket.sendto(ack_packet, (self.dst_ip, self.dst_port))
 
             except Exception as e:
@@ -67,77 +83,86 @@ class Streamer:
                     print(f"Listener error: {e}")
                 break
 
+    def _retransmit_loop(self):
+        """Background thread that retransmits unacked packets after timeout."""
+        while not self.closed:
+            try:
+                to_retransmit = []
+                with self.lock:
+                    now = time.time()
+                    for seq in list(self.unacked_packets.keys()):
+                        packet, send_time = self.unacked_packets[seq]
+                        if now - send_time > 0.25:
+                            to_retransmit.append(packet)
+                            self.unacked_packets[seq] = (packet, now)
+                for packet in to_retransmit:
+                    self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+            except Exception as e:
+                if not self.closed:
+                    print(f"Retransmit error: {e}")
+            time.sleep(0.05)
+
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
-        MAX_PAYLOAD = 1451
+        MAX_PAYLOAD = 1451  # 1472 - 21 byte header
         for i in range(0, len(data_bytes), MAX_PAYLOAD):
             datachunk = data_bytes[i : i + MAX_PAYLOAD]
-            h = hashlib.md5()
-            h.update(datachunk)
-            digest = h.digest() 
-            
+            digest = self._compute_hash(self.next_send_seq, 0, datachunk)
             header = struct.pack('!IB16s', self.next_send_seq, 0, digest)
             packet = header + datachunk
-            
-            acked = False
-            while not acked:
-                self.socket.sendto(packet, (self.dst_ip, self.dst_port))
-                
-                start_time = time.time()
-                while time.time() - start_time < 0.25:
-                    with self.lock:
-                        if self.acked_seq >= self.next_send_seq:
-                            acked = True
-                            break
-                    time.sleep(0.01)
-                
-                if acked:
-                    break
-                else:
-                    print(f"Timeout! Resending packet {self.next_send_seq}")
-            
+
+            # Send without waiting for ACK (pipelining)
+            self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+            with self.lock:
+                self.unacked_packets[self.next_send_seq] = (packet, time.time())
             self.next_send_seq += 1
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
-        
-        import time 
         while True:
             with self.lock:
                 if self.expected_recv_seq in self.receive_buffer:
                     message = self.receive_buffer.pop(self.expected_recv_seq)
                     self.expected_recv_seq += 1
                     return message
-            #print("Still waiting for packet")
             time.sleep(0.01)
 
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
-        # your code goes here, especially after you add ACKs and retransmissions.
+        # 1. Wait for all in-flight data packets to be ACKed
         while True:
             with self.lock:
-                if self.acked_seq >= self.next_send_seq - 1:
+                if not self.unacked_packets:
                     break
             time.sleep(0.01)
 
-        # 2. Send FIN (Type 2) and wait for its ACK
-        # We reuse the same logic as send()
-        fin_packet = struct.pack('!IB16s', self.next_send_seq, 2, b'\x00'*16)
-        acked = False
-        while not acked:
-            self.socket.sendto(fin_packet, (self.dst_ip, self.dst_port))
-            start_time = time.time()
-            while time.time() - start_time < 0.25:
-                with self.lock:
-                    if self.acked_seq >= self.next_send_seq:
-                        acked = True
-                        break
-                time.sleep(0.01)
-        
-        # 3. Give the other side a moment to receive our last ACK
+        # 2. Send FIN and track it for retransmission
+        fin_seq = self.next_send_seq
+        fin_hash = self._compute_hash(fin_seq, 2)
+        fin_packet = struct.pack('!IB16s', fin_seq, 2, fin_hash)
+        self.socket.sendto(fin_packet, (self.dst_ip, self.dst_port))
+        with self.lock:
+            self.unacked_packets[fin_seq] = (fin_packet, time.time())
+
+        # 3. Wait for FIN ACK (retransmit loop handles retransmission)
+        while True:
+            with self.lock:
+                if fin_seq in self.acked:
+                    break
+            time.sleep(0.01)
+
+        # 4. Wait for FIN from other side
+        while True:
+            with self.lock:
+                if self.fin_received:
+                    break
+            time.sleep(0.01)
+
+        # 5. Grace period — keep listener alive to re-ACK retransmitted FINs
         time.sleep(2.0)
-        
+
+        # 6. Cleanup
         self.closed = True
         self.socket.stoprecv()
         self.executor.shutdown(wait=True)
